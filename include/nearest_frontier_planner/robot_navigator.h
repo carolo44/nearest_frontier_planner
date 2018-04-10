@@ -61,6 +61,15 @@ class RobotNavigator
   double longest_distance_;
   double angles_;
 
+  //andy
+  bool init_;
+  int count_;
+  int interval_;
+  sensor_msgs::LaserScan scan_;
+  double angle_min_;
+  double angle_increment_;
+  double goal_x_,goal_y_;
+
   // Everything related to the global map and plan
   NearestFrontierPlanner exploration_planner_;
   GridMap current_map_;

@@ -5,6 +5,10 @@
 #include <set>
 #include <map>
 
+#include <limits>
+#include <vector>
+#include <utility>
+
 
 RobotNavigator::RobotNavigator() {
   ros::NodeHandle robot_node;
@@ -33,12 +37,17 @@ RobotNavigator::RobotNavigator() {
   has_new_map_ = false;
   is_stopped_ = false;
   is_paused_ = false;
+  //andy
+  init_ = false;
+  count_ = 0;
+  interval_ = 16;
+
   goal_publisher_ = robot_node.advertise<geometry_msgs::PoseStamped>(
       "/move_base_simple/goal", 2);
   map_sub_ = robot_node.subscribe("/move_base_node/global_costmap/costmap", 1,
       &RobotNavigator::mapCallback, this);
   ros::Duration(1.0).sleep();
-  scan_sub_ = robot_node.subscribe("/base_scan", 1,
+  scan_sub_ = robot_node.subscribe("/scan", 1,
       &RobotNavigator::scanCallback, this);
 }
 
@@ -95,6 +104,18 @@ void RobotNavigator::receiveExploreGoal(
       return;
     }
 
+    unsigned int goal_x,goal_y;
+    //to get the index of the goal
+    if(init_)
+    {
+      goal_x = (goal_x_ - current_map_.getOriginX()) / current_map_.getResolution();
+      goal_y = (goal_y_ - current_map_.getOriginY()) / current_map_.getResolution();
+      current_map_.getIndex(goal_x,goal_y,goal_point_);
+    }
+       
+    if(!init_ || count_ == interval_ || !current_map_.isFrontier(goal_point_)){
+      count_ = 0;
+      init_ = true;
     // Where are we now
     if ( !setCurrentPosition() ) {
       ROS_ERROR("Exploration failed, could not get current position.");
@@ -103,23 +124,100 @@ void RobotNavigator::receiveExploreGoal(
       return;
     }
 
-    goal_point_ = current_map_.getSize();
+    //goal_point_ = current_map_.getSize();
     if ( preparePlan() ) {
-      ROS_INFO("exploration: start = %u, end = %u.", start_point_, goal_point_);
-      int result = exploration_planner_.findExplorationTarget(&current_map_,
-          start_point_, goal_point_);
-      ROS_INFO("exploration: start = %u, end = %u.", start_point_, goal_point_);
+      //ROS_INFO("exploration: start = %u, end = %u.", start_point_, goal_point_);
       unsigned int x_start = 0, y_start = 0;
       current_map_.getCoordinates(x_start, y_start, start_point_);
-      ROS_INFO("start: x = %u, y = %u", x_start, y_start);
+      //ROS_INFO("start: x = %u, y = %u", x_start, y_start);
       unsigned int x_stop = 0, y_stop = 0;
 
+      int inf_count = 0;
+      int start_i = 0,end_i = 0;
+      std::vector<double> sectors;
+      
+      tf::StampedTransform transform;
+      try {
+        tf_listener_.lookupTransform(map_frame_, robot_frame_, ros::Time(0), transform);
+      } catch ( tf::TransformException ex ) {
+        ROS_ERROR("Could not get robot position: %s", ex.what());
+        return;
+      }
+      double theta = getYaw(transform.getRotation());
+      bool sector_found = false;
+   
+      //to find whether there is a sector
+      for(int i = 0;i < scan_.ranges.size();i++)
+      {
+          if(scan_.ranges[i] >= 10.0)
+            inf_count++;
+          else
+          {
+            if(inf_count > 8)
+            {
+              end_i = i;
+              double direction = (start_i + end_i) / 2 * angle_increment_ + theta - M_PI;
+              unsigned int index0,index1,index2;
+              current_map_.getCoordinates(x_start, y_start, start_point_);
+              current_map_.getIndex(x_start + 4 * std::cos(direction),y_start + 4 * std::sin(direction),index0);
+              current_map_.getIndex(x_start + 8 * std::cos(direction),y_start + 8 * std::sin(direction),index1);
+              current_map_.getIndex(x_start + 12 * std::cos(direction),y_start + 12 * std::sin(direction),index2);
+              if(current_map_.isFrontier(index0) || current_map_.isFrontier(index1) || current_map_.isFrontier(index2))
+              {
+                if(scan_.ranges[start_i] == 10)
+                {
+                  if(start_i == 0)
+                    start_i = scan_.ranges.size() - 1;
+                  else
+                    start_i--;
+                }
+                std::cout << "start_i " << scan_.ranges[start_i] << " end_i " << scan_.ranges[end_i] << std::endl; 
+                if(scan_.ranges[end_i] > scan_.ranges[start_i])
+                  sectors.push_back(/*direction*/end_i * angle_increment_ + theta - M_PI);
+                else
+                  sectors.push_back(/*direction*/start_i * angle_increment_ + theta - M_PI);
+                  sector_found = true;
+              }
+            }
+            inf_count = 0;
+            start_i = i;
+          }
+      }
+      if(!sector_found)  
+      {
+        int result = exploration_planner_.findExplorationTarget(&current_map_,
+        start_point_, goal_point_);
+        //bad_alloc detected(in nearest_frontier_planner.cpp)
+        if(result == -10)
+        {
+          // Sleep remaining time
+          ros::spinOnce();
+          loop_rate.sleep();
+          if ( loop_rate.cycleTime() > ros::Duration(1.0 / update_frequency_) )
+            ROS_WARN("Missed desired rate of %.2fHz! Loop actually took %.4f seconds!",
+            update_frequency_, loop_rate.cycleTime().toSec());
+
+          continue;
+        }
+        current_map_.getCoordinates(x_stop,y_stop,goal_point_);
+        goal_x_ = x_stop * current_map_.getResolution() + current_map_.getOriginX();
+        goal_y_ = y_stop * current_map_.getResolution() + current_map_.getOriginY();
+        interval_ = 16;
+      }
+      else
+      {
+        current_map_.getIndex(x_start + 100 * std::cos(sectors[0]),y_start + 100 * std::sin(sectors[0]),goal_point_);
+        current_map_.getCoordinates(x_stop,y_stop,goal_point_);
+        goal_x_ = x_stop * current_map_.getResolution() + current_map_.getOriginX();
+        goal_y_ = y_stop * current_map_.getResolution() + current_map_.getOriginY();
+        interval_ = 50;
+      }
 
       double x_ = x_start * current_map_.getResolution() +
         current_map_.getOriginX();
       double y_ = y_start * current_map_.getResolution() +
         current_map_.getOriginY();
-      ROS_INFO("start: x = %f, y = %f", x_, y_);
+      //ROS_INFO("start: x = %f, y = %f", x_, y_);
 
       double x, y;
       bool no_vaild_goal = false;
@@ -130,15 +228,15 @@ void RobotNavigator::receiveExploreGoal(
           current_map_.getOriginY();
       } else {
         current_map_.getCoordinates(x_stop, y_stop, goal_point_);
-        std::cout << "start: " << x_start << ", " << y_start << ";  stop: "
-          << x_stop << ", " << y_stop << std::endl;
+        //std::cout << "start: " << x_start << ", " << y_start << ";  stop: "
+          //<< x_stop << ", " << y_stop << std::endl;
 
         if ( ((x_start - x_stop) * (x_start - x_stop) +
               (y_start - y_stop) * (y_start - y_stop)) <= 25 ) {
           x = x_start * current_map_.getResolution() +
             current_map_.getOriginX() +
             (longest_distance_ - 1) * cos(angles_);
-          std::cout << "x = " << x << ", boundx: " << current_map_.getBoundaryX() << std::endl;
+          //std::cout << "x = " << x << ", boundx: " << current_map_.getBoundaryX() << std::endl;
           if ( x <= current_map_.getOriginX() )
             x = current_map_.getOriginX() + 1;
           else if ( x >= current_map_.getBoundaryX() )
@@ -153,7 +251,7 @@ void RobotNavigator::receiveExploreGoal(
             y = current_map_.getBoundaryX() - 1;
 
           no_vaild_goal = true;
-          ROS_INFO("longest_distance_: %f, angles_: %f", longest_distance_, angles_);
+          //ROS_INFO("longest_distance_: %f, angles_: %f", longest_distance_, angles_);
         } else {
           x = x_stop * current_map_.getResolution() +
             current_map_.getOriginX();
@@ -161,7 +259,7 @@ void RobotNavigator::receiveExploreGoal(
             current_map_.getOriginY();
         }
       }
-      ROS_INFO("goal: x = %f, y = %f", x, y);
+      //ROS_INFO("goal: x = %f, y = %f", x, y);
 
       geometry_msgs::PoseStamped goal_base;
       goal_base.header.stamp = ros::Time::now();
@@ -176,8 +274,9 @@ void RobotNavigator::receiveExploreGoal(
           long_rate.sleep();
       }
     }
+   }//andy
     has_new_map_ = false;
-
+    count_++;
     // Sleep remaining time
     ros::spinOnce();
     loop_rate.sleep();
@@ -224,7 +323,23 @@ void RobotNavigator::mapCallback(const nav_msgs::OccupancyGrid& global_map) {
 }
 
 void RobotNavigator::scanCallback(const sensor_msgs::LaserScan& scan) {
-  double angle = scan.angle_min;
+  //andy
+  scan_ = scan;
+  tf::Quaternion q;
+  q.setRPY(0.0, 0.0, scan.angle_min);
+  tf::Stamped<tf::Quaternion> min_q(q, scan.header.stamp,
+                                      scan.header.frame_id);
+  q.setRPY(0.0, 0.0, scan.angle_min + scan.angle_increment);
+  tf::Stamped<tf::Quaternion> inc_q(q, scan.header.stamp,
+                                      scan.header.frame_id);
+  angle_min_ = tf::getYaw(min_q);
+  angle_increment_ = tf::getYaw(inc_q) - angle_min_;
+
+  // wrapping angle to [-pi .. pi]
+  angle_increment_ = fmod(angle_increment_ + 5*M_PI, 2*M_PI) - M_PI;
+  //end andy
+  
+  /*double angle = scan.angle_min;
   int index = 0;
 
   int highest_score = -1;
@@ -243,11 +358,11 @@ void RobotNavigator::scanCallback(const sensor_msgs::LaserScan& scan) {
             best_range = scan.ranges[index];
             best_angle = angle - INDEX * scan.angle_increment;
           }
-          /*
+          
            *std::cout << "in range angle: " << angle - INDEX*scan.angle_increment
            *  << ", range: " << scan.ranges[index]
            *  << ", score: " << scoreLine(angle - INDEX*scan.angle_increment, scan.ranges[index]) << std::endl;
-           */
+           
 
           in_inf_range = false;
         }
@@ -257,11 +372,11 @@ void RobotNavigator::scanCallback(const sensor_msgs::LaserScan& scan) {
           best_range = scan.ranges[index];
           best_angle = angle;
         }
-        /*
+        
          *std::cout << "angle: " << angle
          *  << ", range: " << scan.ranges[index]
          *  << ", score: " << scoreLine(angle, scan.ranges[index]) << std::endl;
-         */
+         
       } else {
         if ( index == 0 ) in_inf_range = true;
         if ( !in_inf_range ) {
@@ -271,11 +386,11 @@ void RobotNavigator::scanCallback(const sensor_msgs::LaserScan& scan) {
             best_range = scan.ranges[index - 1];
             best_angle = angle + INDEX * scan.angle_increment;
           }
-          /*
+          
            *std::cout << "in_inf_range angle: " << angle + INDEX * scan.angle_increment
            *  << ", range: " << scan.ranges[index - 1]
            *  << ", score: " << scoreLine(angle + INDEX*scan.angle_increment, scan.ranges[index - 1]) << std::endl;
-           */
+           
           in_inf_range = true;
         }
       }
@@ -297,7 +412,7 @@ void RobotNavigator::scanCallback(const sensor_msgs::LaserScan& scan) {
   angles_ = best_angle;
   ROS_INFO_STREAM("range: " << longest_distance_
       << ", angle: " << angles_
-      << ", score: " << highest_score);
+      << ", score: " << highest_score);*/
 
 }
 
